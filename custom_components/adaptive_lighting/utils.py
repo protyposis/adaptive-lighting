@@ -10,7 +10,16 @@ from homeassistant.core import (
     Event,
     HomeAssistant,
 )
-from homeassistant.const import ATTR_SUPPORTED_FEATURES
+from homeassistant.const import (
+    ATTR_SUPPORTED_FEATURES,
+    ATTR_DOMAIN,
+    ATTR_SERVICE,
+    ATTR_SERVICE_DATA,
+    ATTR_ENTITY_ID,
+    ATTR_AREA_ID,
+    SERVICE_TURN_ON,
+    SERVICE_TURN_OFF,
+)
 from homeassistant.components.light import (
     SUPPORT_BRIGHTNESS,
     SUPPORT_COLOR,
@@ -28,12 +37,15 @@ from homeassistant.components.light import (
     COLOR_MODE_COLOR_TEMP,
     COLOR_MODE_BRIGHTNESS,
     ATTR_XY_COLOR,
+    DOMAIN as LIGHT_DOMAIN,
 )
 from homeassistant.util.color import (
     color_temperature_to_rgb,
     color_xy_to_RGB,
 )
 import homeassistant.util.dt as dt_util
+import homeassistant.helpers.config_validation as cv
+from homeassistant.helpers.template import area_entities
 
 from .const import (
     ATTR_TURN_ON_OFF_LISTENER,
@@ -380,3 +392,35 @@ class _AsyncSingleShotTimer:
             elapsed_time = (dt_util.utcnow() - self.start_time).total_seconds()
             return max(0, self.delay - elapsed_time)
         return 0
+
+
+def is_light_on_off_event(event: Event) -> bool:
+    if event.data.get(ATTR_DOMAIN) != LIGHT_DOMAIN:
+        return False
+
+    if event.data.get(ATTR_SERVICE) not in [SERVICE_TURN_ON, SERVICE_TURN_OFF]:
+        return False
+
+    return True
+
+
+def get_entity_ids_from_service_event(hass: HomeAssistant, event: Event) -> list[str]:
+    entity_ids = []
+
+    service_data = event.data[ATTR_SERVICE_DATA]
+    if ATTR_ENTITY_ID in service_data:
+        entity_ids = cv.ensure_list_csv(service_data[ATTR_ENTITY_ID])
+    elif ATTR_AREA_ID in service_data:
+        area_ids = cv.ensure_list_csv(service_data[ATTR_AREA_ID])
+        for area_id in area_ids:
+            area_entity_ids = area_entities(hass, area_id)
+            for entity_id in area_entity_ids:
+                if entity_id.startswith(LIGHT_DOMAIN):
+                    entity_ids.append(entity_id)
+            _LOGGER.debug("Found entity_ids '%s' for area_id '%s'", entity_ids, area_id)
+    else:
+        _LOGGER.debug(
+            "No entity_ids or area_ids found in service_data: %s", service_data
+        )
+
+    return entity_ids

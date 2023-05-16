@@ -44,3 +44,24 @@ class Light:
 
         self.last_state_change = None
         self.last_service_data = None
+
+    def process_turn_on_event(self, event: Event):
+        if (task := self.sleep_task) is not None:
+            task.cancel()
+
+        self.turn_on_event = event
+
+        if (
+            (timer := self.auto_reset_manual_control_timer) is not None
+            and timer.is_running()
+            and event.time_fired > timer.start_time
+        ):
+            # Restart the auto reset timer
+            timer.start()
+
+    def process_turn_off_event(self, event: Event):
+        self.turn_off_event = event
+        self.reset()
+
+        if (task := self.split_adaptation_task) is not None:
+            task.cancel()

@@ -30,8 +30,6 @@ from homeassistant.components.switch import DOMAIN as SWITCH_DOMAIN
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    ATTR_AREA_ID,
-    ATTR_DOMAIN,
     ATTR_ENTITY_ID,
     ATTR_SERVICE,
     ATTR_SERVICE_DATA,
@@ -60,7 +58,6 @@ from homeassistant.helpers.event import (
 )
 from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.sun import get_astral_location
-from homeassistant.helpers.template import area_entities
 from homeassistant.util import slugify
 import homeassistant.util.dt as dt_util
 import voluptuous as vol
@@ -68,6 +65,8 @@ import voluptuous as vol
 from .utils import (
     _split_service_data,
     create_context,
+    get_entity_ids_from_service_event,
+    is_light_on_off_event,
     is_our_context,
     _expand_light_groups,
     _attributes_have_changed,
@@ -1240,33 +1239,16 @@ class TurnOnOffListener:
 
     async def turn_on_off_event_listener(self, event: Event) -> None:
         """Track 'light.turn_off' and 'light.turn_on' service calls."""
-        domain = event.data.get(ATTR_DOMAIN)
-        if domain != LIGHT_DOMAIN:
+        if not is_light_on_off_event(event):
+            return
+
+        entity_ids = get_entity_ids_from_service_event(self.hass, event)
+
+        if not entity_ids or not any(eid in self.lights for eid in entity_ids):
             return
 
         service = event.data[ATTR_SERVICE]
         service_data = event.data[ATTR_SERVICE_DATA]
-        if ATTR_ENTITY_ID in service_data:
-            entity_ids = cv.ensure_list_csv(service_data[ATTR_ENTITY_ID])
-        elif ATTR_AREA_ID in service_data:
-            area_ids = cv.ensure_list_csv(service_data[ATTR_AREA_ID])
-            entity_ids = []
-            for area_id in area_ids:
-                area_entity_ids = area_entities(self.hass, area_id)
-                for entity_id in area_entity_ids:
-                    if entity_id.startswith(LIGHT_DOMAIN):
-                        entity_ids.append(entity_id)
-                _LOGGER.debug(
-                    "Found entity_ids '%s' for area_id '%s'", entity_ids, area_id
-                )
-        else:
-            _LOGGER.debug(
-                "No entity_ids or area_ids found in service_data: %s", service_data
-            )
-            return
-
-        if not any(eid in self.lights for eid in entity_ids):
-            return
 
         if service == SERVICE_TURN_OFF:
             transition = service_data.get(ATTR_TRANSITION)
@@ -1277,11 +1259,7 @@ class TurnOnOffListener:
                 event.context.id,
             )
             for eid in entity_ids:
-                light = self.lights[eid]
-                light.turn_off_event = event
-                light.reset()
-                if (task := light.split_adaptation_task) is not None:
-                    task.cancel()
+                self.lights[eid].process_turn_off_event(event)
 
         elif service == SERVICE_TURN_ON:
             _LOGGER.debug(
@@ -1290,18 +1268,7 @@ class TurnOnOffListener:
                 event.context.id,
             )
             for eid in entity_ids:
-                light = self.lights[eid]
-                if (task := light.sleep_task) is not None:
-                    task.cancel()
-                light.turn_on_event = event
-                timer = light.auto_reset_manual_control_timer
-                if (
-                    timer is not None
-                    and timer.is_running()
-                    and event.time_fired > timer.start_time
-                ):
-                    # Restart the auto reset timer
-                    timer.start()
+                self.lights[eid].process_turn_on_event(event)
 
     async def state_changed_event_listener(self, event: Event) -> None:
         """Track 'state_changed' events."""
