@@ -270,15 +270,15 @@ def _split_service_data(service_data, adapt_brightness, adapt_color):
         # Split the transition over both commands
         service_data[ATTR_TRANSITION] /= 2
     service_datas = []
-    if adapt_color:
-        service_data_color = service_data.copy()
-        service_data_color.pop(ATTR_BRIGHTNESS, None)
-        service_datas.append(service_data_color)
     if adapt_brightness:
         service_data_brightness = service_data.copy()
         service_data_brightness.pop(ATTR_RGB_COLOR, None)
         service_data_brightness.pop(ATTR_COLOR_TEMP_KELVIN, None)
         service_datas.append(service_data_brightness)
+    if adapt_color:
+        service_data_color = service_data.copy()
+        service_data_color.pop(ATTR_BRIGHTNESS, None)
+        service_datas.append(service_data_color)
 
     if not service_datas:  # neither adapt_brightness nor adapt_color
         return [service_data]
