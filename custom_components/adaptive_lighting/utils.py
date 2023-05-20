@@ -19,6 +19,8 @@ from homeassistant.const import (
     ATTR_AREA_ID,
     SERVICE_TURN_ON,
     SERVICE_TURN_OFF,
+    STATE_ON,
+    STATE_OFF,
 )
 from homeassistant.components.light import (
     SUPPORT_BRIGHTNESS,
@@ -50,6 +52,11 @@ from homeassistant.helpers.template import area_entities
 from .const import (
     ATTR_TURN_ON_OFF_LISTENER,
     DOMAIN,
+)
+from .switch import (
+    BRIGHTNESS_ATTRS,
+    COLOR_ATTRS,
+    ServiceData,
 )
 
 _SUPPORT_OPTS = {
@@ -147,19 +154,22 @@ def is_our_context(context: Context | None) -> bool:
     return f":{_DOMAIN_SHORT}:" in context.id
 
 
-def _split_service_data(service_data, adapt_brightness, adapt_color):
+def prepare_service_calls(service_data: ServiceData, separate_turn_on_commands: bool) -> list[ServiceData]:
     """Split service_data into two dictionaries (for color and brightness)."""
+    if not separate_turn_on_commands:
+        return [service_data]
+
     transition = service_data.get(ATTR_TRANSITION)
     if transition is not None:
         # Split the transition over both commands
         service_data[ATTR_TRANSITION] /= 2
     service_datas = []
-    if adapt_brightness:
+    if any(key in service_data for key in BRIGHTNESS_ATTRS):
         service_data_brightness = service_data.copy()
         service_data_brightness.pop(ATTR_RGB_COLOR, None)
         service_data_brightness.pop(ATTR_COLOR_TEMP_KELVIN, None)
         service_datas.append(service_data_brightness)
-    if adapt_color:
+    if any(key in service_data for key in COLOR_ATTRS):
         service_data_color = service_data.copy()
         service_data_color.pop(ATTR_BRIGHTNESS, None)
         service_datas.append(service_data_color)
@@ -424,3 +434,15 @@ def get_entity_ids_from_service_event(hass: HomeAssistant, event: Event) -> list
         )
 
     return entity_ids
+
+
+def is_turn_on_event(event: Event):
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+    return old_state is not None and old_state.state == STATE_OFF and new_state is not None and new_state.state == STATE_ON
+
+
+def is_turn_off_event(event: Event):
+    old_state = event.data.get("old_state")
+    new_state = event.data.get("new_state")
+    return old_state is not None and old_state.state == STATE_ON and new_state is not None and new_state.state == STATE_OFF

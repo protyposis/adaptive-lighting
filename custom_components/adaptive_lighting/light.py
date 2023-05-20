@@ -24,7 +24,7 @@ class Light:
         # Track last 'service_data' to 'light.turn_on' resulting from this integration
         self.last_service_data: dict[str, Any] = {}
         # Track ongoing split adaptations to be able to cancel them
-        self.split_adaptation_task: asyncio.Task | None = None
+        self.adaptation_task: asyncio.Task | None = None
 
         # Track auto reset of manual_control
         self.auto_reset_manual_control_timer: _AsyncSingleShotTimer | None = None
@@ -63,5 +63,5 @@ class Light:
         self.turn_off_event = event
         self.reset()
 
-        if (task := self.split_adaptation_task) is not None:
+        if (task := self.adaptation_task) is not None:
             task.cancel()

@@ -63,7 +63,7 @@ import homeassistant.util.dt as dt_util
 import voluptuous as vol
 
 from .utils import (
-    _split_service_data,
+    prepare_service_calls,
     create_context,
     get_entity_ids_from_service_event,
     is_light_on_off_event,
@@ -73,6 +73,8 @@ from .utils import (
     _AsyncSingleShotTimer,
     match_switch_state_event,
     _supported_features,
+    is_turn_on_event,
+    is_turn_off_event,
 )
 from .light import Light
 from .sun import SunLightSettings
@@ -150,6 +152,8 @@ BRIGHTNESS_ATTRS = {
     ATTR_BRIGHTNESS_STEP,
     ATTR_BRIGHTNESS_STEP_PCT,
 }
+
+ServiceData = dict[str, Any]
 
 
 def _get_switches_with_lights(
@@ -464,7 +468,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
 
     def __init__(
         self,
-        hass,
+        hass: HomeAssistant,
         config_entry: ConfigEntry,
         turn_on_off_listener: TurnOnOffListener,
         sleep_mode_switch: SimpleSwitch,
@@ -669,7 +673,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         if self._lights:
             self._expand_light_groups()
             remove_state = async_track_state_change_event(
-                self.hass, self._lights, self._light_event
+                self.hass, self._lights, self._async_light_state_changed_listener
             )
             self.remove_listeners.append(remove_state)
 
@@ -771,6 +775,35 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         if lock is not None and lock.locked():
             _LOGGER.debug("%s: '%s' is locked", self._name, light_id)
             return
+
+        service_data = self._build_adapted_service_data(
+            light_id, transition, adapt_brightness, adapt_color, prefer_rgb_color)
+        context = context or self.create_context("adapt_lights")
+
+        # See #80. Doesn't check if transitions differ but it does the job.
+        light = self.turn_on_off_listener.lights.get(light_id)
+        if not force and light.last_service_data == service_data:
+            _LOGGER.debug(
+                "%s: Cancelling adapt to light %s, there's no new values to set (context.id='%s')",
+                self._name,
+                light_id,
+                context.id,
+            )
+            return
+        else:
+            light.last_service_data = service_data
+
+        service_datas = prepare_service_calls(service_data, self._separate_turn_on_commands)
+        await self._make_cancellable_service_calls(service_datas, context, light_id)
+
+    def _build_adapted_service_data(
+        self,
+        light_id: str,
+        transition: int | None = None,
+        adapt_brightness: bool | None = None,
+        adapt_color: bool | None = None,
+        prefer_rgb_color: bool | None = None,
+    ) -> ServiceData:
         if transition is None:
             transition = self._transition
         if adapt_brightness is None:
@@ -780,10 +813,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
         if prefer_rgb_color is None:
             prefer_rgb_color = self._prefer_rgb_color
 
-        # The switch might be off and not have _settings set.
-        self._settings = self._sun_light_settings.calculate(
-            self.sleep_mode_switch.is_on, transition
-        )
+        self._update_sun_light_settings(transition)
 
         # Build service data.
         service_data = {ATTR_ENTITY_ID: light_id}
@@ -817,22 +847,25 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             _LOGGER.debug("%s: Setting rgb_color of light %s", self._name, light_id)
             service_data[ATTR_RGB_COLOR] = self._settings["rgb_color"]
 
-        context = context or self.create_context("adapt_lights")
+        return service_data
 
-        # See #80. Doesn't check if transitions differ but it does the job.
-        light = self.turn_on_off_listener.lights.get(light_id)
-        if not force and light.last_service_data == service_data:
-            _LOGGER.debug(
-                "%s: Cancelling adapt to light %s, there's no new values to set (context.id='%s')",
-                self._name,
-                light_id,
-                context.id,
-            )
-            return
-        else:
-            light.last_service_data = service_data
+    # TODO change transition type to float??? This does not allow sub-second precision!!!
+    def _update_sun_light_settings(self, transition: int | None = None):
+        # TODO move settings to sunlightsettings class
+        self._settings = self._sun_light_settings.calculate(
+            self.sleep_mode_switch.is_on, transition
+        )
 
-        async def turn_on(service_data):
+    async def _make_service_calls(self, service_datas: list[ServiceData], context: Context):
+        for i, service_data in enumerate(service_datas):
+            is_not_first = i > 0
+
+            if is_not_first:
+                if (transition := service_data.get(ATTR_TRANSITION)) is not None:
+                    await asyncio.sleep(transition)
+
+                await asyncio.sleep(self._send_split_delay / 1000.0)
+
             _LOGGER.debug(
                 "%s: Scheduling 'light.turn_on' with the following 'service_data': %s"
                 " with context.id='%s'",
@@ -847,36 +880,16 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 context=context,
             )
 
-        async def turn_on_split():
-            # Could be a list of length 1 or 2
-            service_datas = _split_service_data(
-                service_data, adapt_brightness, adapt_color
-            )
-            await turn_on(service_datas[0])
-            if len(service_datas) == 2:
-                transition = service_datas[0].get(ATTR_TRANSITION)
-                if transition is not None:
-                    await asyncio.sleep(transition)
-                await asyncio.sleep(self._send_split_delay / 1000.0)
-                await turn_on(service_datas[1])
+    async def _make_cancellable_service_calls(self, service_datas: list[ServiceData], context: Context, light_id: str):
+        if (previous_task := self.turn_on_off_listener.lights[light_id].adaptation_task) is not None:
+            previous_task.cancel()
 
-        if not self._separate_turn_on_commands:
-            await turn_on(service_data)
-        else:
-            if (
-                previous_task := self.turn_on_off_listener.split_adaptation_tasks.get(
-                    light_id
-                )
-            ) is not None:
-                previous_task.cancel()
-
-            try:
-                task = self.turn_on_off_listener.split_adaptation_tasks[
-                    light_id
-                ] = asyncio.ensure_future(turn_on_split())
-                await task
-            except asyncio.CancelledError:
-                _LOGGER.debug("Split adaptation of %s cancelled", light_id)
+        try:
+            task = self.turn_on_off_listener.lights[light_id].adaptation_task = asyncio.ensure_future(
+                self._make_service_calls(service_datas, context))
+            await task
+        except asyncio.CancelledError:
+            _LOGGER.debug("Ongoing adaptation of %s cancelled", light_id)
 
     async def _update_attrs_and_maybe_adapt_lights(
         self,
@@ -892,9 +905,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             context.id,
         )
         assert self.is_on
-        self._settings.update(
-            self._sun_light_settings.calculate(self.sleep_mode_switch.is_on, transition)
-        )
+        self._update_sun_light_settings(transition)
         self.async_write_ha_state()
 
         if lights is None:
@@ -906,7 +917,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 return
             for light in lights:
                 # Don't adapt lights that haven't finished prior transitions.
-                timer = self.turn_on_off_listener.transition_timers.get(light)
+                timer = self.turn_on_off_listener.lights[light].transition_timer
                 if timer is not None and timer.is_running():
                     _LOGGER.debug(
                         "%s: Light '%s' is still transitioning",
@@ -997,16 +1008,10 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
             context=self.create_context("sleep", parent=event.context),
         )
 
-    async def _light_event(self, event: Event) -> None:
-        old_state = event.data.get("old_state")
-        new_state = event.data.get("new_state")
+    async def _async_light_state_changed_listener(self, event: Event) -> None:
         entity_id = event.data.get("entity_id")
-        if (
-            old_state is not None
-            and old_state.state == STATE_OFF
-            and new_state is not None
-            and new_state.state == STATE_ON
-        ):
+
+        if is_turn_on_event(event):
             _LOGGER.debug(
                 "%s: Detected an 'off' → 'on' event for '%s' with context.id='%s'",
                 self._name,
@@ -1052,12 +1057,7 @@ class AdaptiveSwitch(SwitchEntity, RestoreEntity):
                 force=True,
                 context=self.create_context("light_event", parent=event.context),
             )
-        elif (
-            old_state is not None
-            and old_state.state == STATE_ON
-            and new_state is not None
-            and new_state.state == STATE_OFF
-        ):
+        elif is_turn_off_event(event):
             # Tracks 'off' → 'on' state changes
             self._on_to_off_event[entity_id] = event
             self.turn_on_off_listener.reset(entity_id)
@@ -1285,8 +1285,6 @@ class TurnOnOffListener:
                 new_state.attributes,
                 new_state.context.id,
             )
-
-        if new_state is not None and new_state.state == STATE_ON:
             # It is possible to have multiple state change events with the same context.
             # This can happen because a `turn_on.light(brightness_pct=100, transition=30)`
             # event leads to an instant state change of
